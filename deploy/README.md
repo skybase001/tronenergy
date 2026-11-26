@@ -9,3 +9,23 @@ docker compose --env-file .env -f deploy/compose/compose.yaml up --build -d
 ```
 
 签名禁用时私钥文件可以为空。其余目录预留给后续生产编排、主备、备份与可观测性配置。当前不提供主网高可用部署。详见 [运行说明](../docs/implementation-v1.md)。
+
+## GitHub Actions
+
+- `CI`：推送到 main/master/debug、提交 PR 或手动运行时触发。使用 Python 3.13 安装锁定依赖和项目，执行 Ruff、单元测试和 PostgreSQL 17 集成测试，最后构建统一 Docker 镜像。数据库由临时 CI 服务提供，无需配置数据库 Secret；不运行真实测试网验收。
+- `CD`：在 Actions → CD → Run workflow 选择分支/标签手动运行，或推送 `v*` 标签触发。先调用完整 CI，通过后发布统一镜像到 `ghcr.io/<owner>/<repo>`（全小写）。当前完成镜像交付，不自动连接服务器、执行生产迁移或重启服务。
+
+镜像包含 `sha-<完整提交 SHA>` 标签；版本标签触发时另生成对应标签，例如 `v0.1.0`。不更新 `latest`，便于明确选择部署版本。每次发布的镜像 digest 可在 Actions 运行摘要查看。
+
+GHCR 登录使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需新增个人令牌。仓库/组织需允许 Actions 发布 Packages；若同名包已经存在，需在包设置中授予当前仓库写入权限。发布方式参考 [GitHub 官方说明](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)。
+
+也可以用已登录的 GitHub CLI 操作（将 `<owner>/<repo>` 替换成仓库名）：
+
+```bash
+gh workflow run ci.yml --repo <owner>/<repo> --ref main
+gh workflow run cd.yml --repo <owner>/<repo> --ref main
+gh run list --repo <owner>/<repo>
+gh run watch <run-id> --repo <owner>/<repo>
+```
+
+首次使用前需将工作流文件推送到默认分支，才能从界面或 CLI 手动触发。现有 Compose 仍从源码构建；服务器使用发布镜像时，应将应用服务的镜像配置为摘要中给出的 `ghcr.io/<owner>/<repo>@sha256:...` 并使用 `--no-build`，同时保留服务器自己的环境配置和私钥挂载。
