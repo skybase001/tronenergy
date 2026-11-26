@@ -1,0 +1,75 @@
+x-app: &app
+  build:
+    context: ../..
+    dockerfile: deploy/containers/Dockerfile
+  env_file: ../../.env
+  environment: &env
+    TE_DATABASE_URL: postgresql://tronenergy:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/tronenergy
+    TE_REDIS_URL: redis://redis:6379/0
+    TE_CHAIN_URL: http://chain-service:8002
+    TE_RENTAL_URL: http://rental-service:8001
+    TE_SIGNER_URL: http://signer-service:8003
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: tronenergy
+      POSTGRES_USER: tronenergy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tronenergy -d tronenergy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    command: ["python", "-m", "tronenergy_storage.migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api-service:
+    <<: *app
+    command: ["uvicorn", "tronenergy_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:8000:8000"]
+  rental-service:
+    <<: *app
+    command: ["uvicorn", "tronenergy_rental.main:app", "--host", "0.0.0.0", "--port", "8001"]
+  rental-worker:
+    <<: *app
+    command: ["python", "-m", "tronenergy_rental.worker"]
+  chain-service:
+    <<: *app
+    command: ["uvicorn", "tronenergy_chain.main:app", "--host", "0.0.0.0", "--port", "8002"]
+  signer-service:
+    <<: *app
+    command: ["uvicorn", "tronenergy_signer.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment:
+      <<: *env
+      TE_PRIVATE_KEY_FILE: /run/secrets/tron_testnet_key
+    secrets: [tron_testnet_key]
+  observer-worker:
+    <<: *app
+    command: ["python", "-m", "tronenergy_observer.worker"]
+
+volumes:
+  postgres-data:
+  redis-data:
+
+secrets:
+  tron_testnet_key:
+    file: ../../config/local/signer.key
