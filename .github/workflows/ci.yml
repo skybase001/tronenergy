@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, debug]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install dependencies and project
+        run: |
+          python -m pip install --only-binary=coincurve -r requirements.lock
+          python -m pip install --no-deps -e .
+      - name: Lint
+        run: python -m ruff check .
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build application image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/containers/Dockerfile
+          push: false
+          tags: tronenergy:sha-${{ github.sha }}
+          cache-from: type=gha,scope=tronenergy
+          cache-to: type=gha,mode=max,scope=tronenergy
