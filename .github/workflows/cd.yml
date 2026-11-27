@@ -1,65 +1,114 @@
 name: CD
 
 on:
-  push:
-    tags: ['v*']
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: cd-${{ github.ref }}
+  group: tronenergy-deployment
   cancel-in-progress: false
 
 jobs:
-  ci:
-    uses: ./.github/workflows/ci.yml
-
-  publish:
-    needs: ci
+  deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Prepare image name
-        id: image
+      - name: Deploy TronEnergy with Docker Compose
         env:
-          REPOSITORY: ${{ github.repository }}
-        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Prepare image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.name }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=sha-${{ github.sha }}
-            type=ref,event=tag
-      - uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish image
-        id: publish
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/containers/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=tronenergy
-          cache-to: type=gha,mode=max,scope=tronenergy
-      - name: Write image summary
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          DIGEST: ${{ steps.publish.outputs.digest }}
+          REGISTRY_HOST: crpi-9jwlonaugv9hai08.cn-guangzhou.personal.cr.aliyuncs.com
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_COMPOSE_FILE: ${{ vars.DEPLOY_COMPOSE_FILE }}
+          DEPLOY_ENV_FILE: ${{ vars.DEPLOY_ENV_FILE }}
+          DEPLOY_IMAGE: crpi-9jwlonaugv9hai08.cn-guangzhou.personal.cr.aliyuncs.com/snake-2001/tronenergy:sha-${{ github.sha }}
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+          BASTION_HOST: ${{ vars.BASTION_HOST }}
+          BASTION_USER: ${{ vars.BASTION_USER }}
+          BASTION_PORT: ${{ vars.BASTION_PORT || '22' }}
+          BASTION_SSH_PRIVATE_KEY: ${{ secrets.BASTION_SSH_PRIVATE_KEY }}
+          BASTION_SSH_KNOWN_HOSTS: ${{ secrets.BASTION_SSH_KNOWN_HOSTS }}
+        shell: bash
         run: |
-          printf 'Published image: `%s@%s`\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          for name in REGISTRY_USERNAME REGISTRY_PASSWORD DEPLOY_HOST DEPLOY_USER DEPLOY_COMPOSE_FILE SSH_PRIVATE_KEY SSH_KNOWN_HOSTS BASTION_HOST BASTION_USER BASTION_SSH_PRIVATE_KEY BASTION_SSH_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Configure $name in repository Actions variables/secrets."
+              exit 1
+            fi
+          done
+          # Validate values before inserting them into the SSH configuration.
+          for name in DEPLOY_HOST BASTION_HOST; do
+            [[ "${!name}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]*$ ]] || { echo "::error::Invalid $name"; exit 1; }
+          done
+          for name in DEPLOY_USER BASTION_USER; do
+            [[ "${!name}" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || { echo "::error::Invalid $name"; exit 1; }
+          done
+          for name in DEPLOY_PORT BASTION_PORT; do
+            [[ "${!name}" =~ ^[0-9]{1,5}$ ]] && (( 10#${!name} >= 1 && 10#${!name} <= 65535 )) || { echo "::error::Invalid $name"; exit 1; }
+          done
+          # Restrict the remote path so it can safely be passed through SSH.
+          [[ "$DEPLOY_COMPOSE_FILE" =~ ^/[a-zA-Z0-9_./-]+$ ]] || { echo '::error::Use an absolute Compose path without spaces.'; exit 1; }
+          DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-$(dirname "$DEPLOY_COMPOSE_FILE")/.env}"
+          [[ "$DEPLOY_ENV_FILE" =~ ^/[a-zA-Z0-9_./-]+$ ]] || { echo '::error::Use an absolute environment file path without spaces.'; exit 1; }
+          ssh_dir="$(mktemp -d)"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          printf '%s\n' "$BASTION_SSH_PRIVATE_KEY" > "$ssh_dir/bastion_key"
+          printf '%s\n' "$BASTION_SSH_KNOWN_HOSTS" > "$ssh_dir/bastion_known_hosts"
+          cat > "$ssh_dir/config" <<EOF
+          Host bastion
+            HostName $BASTION_HOST
+            User $BASTION_USER
+            Port $BASTION_PORT
+            IdentityFile $ssh_dir/bastion_key
+            UserKnownHostsFile $ssh_dir/bastion_known_hosts
+          Host deployment
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            Port $DEPLOY_PORT
+            IdentityFile $ssh_dir/key
+            UserKnownHostsFile $ssh_dir/known_hosts
+            ProxyJump bastion
+          Host *
+            BatchMode yes
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ConnectTimeout 20
+            ForwardAgent no
+          EOF
+          chmod 600 "$ssh_dir"/*
+          # Send shell-escaped credentials over encrypted stdin, not command arguments.
+          {
+          printf 'REGISTRY_HOST=%q\nREGISTRY_USERNAME=%q\nREGISTRY_PASSWORD=%q\n' "$REGISTRY_HOST" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+          cat <<'REMOTE'
+          set -euo pipefail
+          compose_file="$1"
+          env_file="$2"
+          export TE_IMAGE="$3"
+          test -f "$compose_file"
+          test -f "$env_file"
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin
+          unset REGISTRY_PASSWORD
+          compose=(docker compose --env-file "$env_file" -f "$compose_file")
+          apps=(api-service rental-service rental-worker chain-service signer-service observer-worker)
+          "${compose[@]}" config --quiet
+          # Pull before stopping the running release.
+          "${compose[@]}" pull migrate "${apps[@]}"
+          "${compose[@]}" up -d --wait --wait-timeout 120 postgres redis
+          # Stop old writers before running migrations.
+          "${compose[@]}" stop -t 60 "${apps[@]}"
+          "${compose[@]}" run --rm --no-deps -T migrate
+          "${compose[@]}" up -d --no-build --no-deps --wait --wait-timeout 120 "${apps[@]}"
+          "${compose[@]}" ps "${apps[@]}"
+          "${compose[@]}" exec -T api-service python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health/ready", timeout=10)'
+          REMOTE
+          } | ssh -F "$ssh_dir/config" deployment "bash -se -- '$DEPLOY_COMPOSE_FILE' '$DEPLOY_ENV_FILE' '$DEPLOY_IMAGE'"
