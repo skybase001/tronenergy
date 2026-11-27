@@ -103,7 +103,6 @@ jobs:
           "${compose[@]}" config --quiet
           # Pull before stopping the running release.
           "${compose[@]}" pull migrate "${apps[@]}"
-          "${compose[@]}" up -d --wait --wait-timeout 120 postgres redis
           # Stop old writers before running migrations.
           "${compose[@]}" stop -t 60 "${apps[@]}"
           "${compose[@]}" run --rm --no-deps -T migrate
