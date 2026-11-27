@@ -109,4 +109,5 @@ jobs:
           "${compose[@]}" up -d --no-build --no-deps --wait --wait-timeout 120 "${apps[@]}"
           "${compose[@]}" ps "${apps[@]}"
           "${compose[@]}" exec -T api-service python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health/ready", timeout=10)'
-          printf '%s\n' "$TRONENERGY_IMAGE" > .deployed-image
+          REMOTE
+          } | ssh -F "$ssh_dir/config" deployment "bash -se -- '$DEPLOY_COMPOSE_FILE'"
